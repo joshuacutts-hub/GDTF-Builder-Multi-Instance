@@ -215,10 +215,11 @@ class ChannelSlot:
         self.slot_name     = slot_name or name
 
 class ChannelDef:
-    def __init__(self, name, is_fine_byte=False, slots=None):
+    def __init__(self, name, is_fine_byte=False, slots=None, geometry="body"):
         self.name         = name
         self.is_fine_byte = is_fine_byte
         self.slots        = slots or []
+        self.geometry     = geometry  # "body" | "cell" | "virtual"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -257,9 +258,9 @@ def _guid():
 def _new_channel_id():
     return uuid.uuid4().hex[:8]
 
-def make_channel_entry(name, fine=False):
+def make_channel_entry(name, fine=False, geometry="body"):
     return {"id": _new_channel_id(), "name": name,
-            "is_fine": fine, "slots": []}
+            "is_fine": fine, "slots": [], "geometry": geometry}
 
 def make_slot_entry(dmx_from=0, dmx_to=10, name=""):
     return {"dmx_from": dmx_from, "dmx_to": dmx_to, "name": name}
@@ -283,6 +284,7 @@ def channel_defs_from_mode(mode):
             name=ch["name"],
             is_fine_byte=ch.get("is_fine", False),
             slots=slots,
+            geometry=ch.get("geometry", "body"),
         ))
     return defs
 
@@ -293,8 +295,70 @@ def channel_defs_from_mode(mode):
 #  DMX slots -> ChannelFunction (full range) + ChannelSet per slot
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _emit_one_channel(chs_el, ch, safe_mode, wheel_registry,
+                      geometry_name, offset, virtual=False):
+    """
+    Emit a single DMXChannel element.
+    virtual=True  -> Offset="None"  (no DMX address — MA3 virtual dimmer)
+    Returns (ch_el, offset_used) where offset_used is the address consumed
+    (None for virtual channels).
+    """
+    attr, fg, feat, ag = resolve_attr(ch.name)
+    safe_ch    = _safe(ch.name, f"Ch{offset if not virtual else 'V'}")
+    cf_name    = attr
+    offset_str = "None" if virtual else str(offset)
+    initial_fn = f"{safe_mode}.{safe_ch}.{attr}.{cf_name}"
+
+    if ch.slots:
+        wname = wheel_registry.get(attr, "")
+        ch_el = ET.SubElement(chs_el, "DMXChannel",
+            DMXBreak="1", Offset=offset_str,
+            Default="0/1", Highlight="255/1",
+            Geometry=geometry_name, InitialFunction=initial_fn)
+        log_el = ET.SubElement(ch_el, "LogicalChannel",
+            Attribute=attr, Snap="Yes",
+            Master="None", MibFade="0", DMXChangeTimeLimit="0")
+        cf_kw = dict(
+            Name=cf_name, Attribute=attr,
+            OriginalAttribute=_safe(ch.name),
+            DMXFrom="0/1", Default="0/1",
+            PhysicalFrom="0.000000", PhysicalTo="1.000000",
+            RealFade="0", RealAcceleration="0", WheelSlotIndex="0",
+        )
+        if wname:
+            cf_kw["Wheel"] = wname
+        cf_el = ET.SubElement(log_el, "ChannelFunction", **cf_kw)
+        for slot_idx, slot in enumerate(ch.slots):
+            cs_kw = dict(
+                Name=_safe(slot.name, f"Set{slot_idx+1}"),
+                DMXFrom=f"{slot.dmx_from}/1",
+                PhysicalFrom=f"{slot.physical_from:.6f}",
+                PhysicalTo=f"{slot.physical_to:.6f}",
+            )
+            if wname:
+                cs_kw["WheelSlotIndex"] = str(slot_idx + 1)
+            ET.SubElement(cf_el, "ChannelSet", **cs_kw)
+    else:
+        ch_el = ET.SubElement(chs_el, "DMXChannel",
+            DMXBreak="1", Offset=offset_str,
+            Default="0/1", Highlight="255/1",
+            Geometry=geometry_name, InitialFunction=initial_fn)
+        log_el = ET.SubElement(ch_el, "LogicalChannel",
+            Attribute=attr, Snap="No",
+            Master="None", MibFade="0", DMXChangeTimeLimit="0")
+        ET.SubElement(log_el, "ChannelFunction",
+            Name=cf_name, Attribute=attr,
+            OriginalAttribute=_safe(ch.name),
+            DMXFrom="0/1", Default="0/1",
+            PhysicalFrom="0.000000", PhysicalTo="1.000000",
+            RealFade="0", RealAcceleration="0", WheelSlotIndex="0")
+
+    return ch_el
+
+
 def _emit_channels_for_geometry(chs_el, channels, safe_mode,
                                 wheel_registry, geometry_name, start_offset):
+    """Emit a list of ChannelDef objects to geometry_name. Returns next offset."""
     offset = start_offset
     prev_ch_el = None
     prev_offset_start = None
@@ -309,58 +373,14 @@ def _emit_channels_for_geometry(chs_el, channels, safe_mode,
             prev_ch_el = None
             continue
 
-        attr, fg, feat, ag = resolve_attr(ch.name)
-        safe_ch = _safe(ch.name, f"Ch{offset}")
-        cf_name = attr
-        initial_fn = f"{safe_mode}.{safe_ch}.{attr}.{cf_name}"
-
-        if ch.slots:
-            wname = wheel_registry.get(attr, "")
-            ch_el = ET.SubElement(chs_el, "DMXChannel",
-                DMXBreak="1", Offset=str(offset),
-                Default="0/1", Highlight="255/1",
-                Geometry=geometry_name, InitialFunction=initial_fn)
-            log_el = ET.SubElement(ch_el, "LogicalChannel",
-                Attribute=attr, Snap="Yes",
-                Master="None", MibFade="0", DMXChangeTimeLimit="0")
-            cf_kw = dict(
-                Name=cf_name, Attribute=attr,
-                OriginalAttribute=_safe(ch.name),
-                DMXFrom="0/1", Default="0/1",
-                PhysicalFrom="0.000000", PhysicalTo="1.000000",
-                RealFade="0", RealAcceleration="0", WheelSlotIndex="0",
-            )
-            if wname:
-                cf_kw["Wheel"] = wname
-            cf_el = ET.SubElement(log_el, "ChannelFunction", **cf_kw)
-            for slot_idx, slot in enumerate(ch.slots):
-                cs_kw = dict(
-                    Name=_safe(slot.name, f"Set{slot_idx+1}"),
-                    DMXFrom=f"{slot.dmx_from}/1",
-                    PhysicalFrom=f"{slot.physical_from:.6f}",
-                    PhysicalTo=f"{slot.physical_to:.6f}",
-                )
-                if wname:
-                    cs_kw["WheelSlotIndex"] = str(slot_idx + 1)
-                ET.SubElement(cf_el, "ChannelSet", **cs_kw)
-        else:
-            ch_el = ET.SubElement(chs_el, "DMXChannel",
-                DMXBreak="1", Offset=str(offset),
-                Default="0/1", Highlight="255/1",
-                Geometry=geometry_name, InitialFunction=initial_fn)
-            log_el = ET.SubElement(ch_el, "LogicalChannel",
-                Attribute=attr, Snap="No",
-                Master="None", MibFade="0", DMXChangeTimeLimit="0")
-            ET.SubElement(log_el, "ChannelFunction",
-                Name=cf_name, Attribute=attr,
-                OriginalAttribute=_safe(ch.name),
-                DMXFrom="0/1", Default="0/1",
-                PhysicalFrom="0.000000", PhysicalTo="1.000000",
-                RealFade="0", RealAcceleration="0", WheelSlotIndex="0")
-
-        prev_ch_el = ch_el
-        prev_offset_start = offset
-        offset += 1
+        virtual = (getattr(ch, "geometry", "body") == "virtual")
+        ch_el = _emit_one_channel(chs_el, ch, safe_mode, wheel_registry,
+                                  geometry_name, offset, virtual=virtual)
+        if not virtual:
+            prev_ch_el = ch_el
+            prev_offset_start = offset
+            offset += 1
+        # virtual channels don't advance offset and don't pair with fine bytes
 
     return offset
 
@@ -479,14 +499,29 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
         chs_el = ET.SubElement(mode_el, "DMXChannels")
 
         if not multi_cell:
+            # Single geometry — all channels go to Body regardless of geometry tag
             _emit_channels_for_geometry(
                 chs_el, channels, safe_mode,
                 wheel_registry, "Body", start_offset=1)
         else:
-            next_offset = 1
+            # Split channels by geometry field:
+            #   "body"    -> Body geometry (emitted once, shared channels)
+            #   "cell"    -> Cell_N geometry (emitted once per cell, repeating)
+            #   "virtual" -> Cell_N geometry, Offset="None" (no DMX address)
+            body_chs    = [c for c in channels
+                           if getattr(c, "geometry", "body") == "body"]
+            cell_chs    = [c for c in channels
+                           if getattr(c, "geometry", "body") in ("cell", "virtual")]
+
+            # Body channels first (once, no repetition)
+            next_offset = _emit_channels_for_geometry(
+                chs_el, body_chs, safe_mode,
+                wheel_registry, "Body", start_offset=1)
+
+            # Cell channels repeated N times
             for n in range(1, cell_count + 1):
                 next_offset = _emit_channels_for_geometry(
-                    chs_el, channels, safe_mode,
+                    chs_el, cell_chs, safe_mode,
                     wheel_registry, f"Cell_{n}",
                     start_offset=next_offset)
 
@@ -909,12 +944,27 @@ for mode_idx, mode in enumerate(st.session_state.modes):
             st.rerun()
     with hc3:
         st.write(""); st.write("")
-        st.markdown(
-            f'<p style="color:var(--ma-amber);font-family:Share Tech Mono,'
-            f'monospace;font-size:0.82rem;margin-top:0.55rem">'
-            f'{len(ch_list)} CH</p>',
-            unsafe_allow_html=True
-        )
+        _mc2 = int(st.session_state.get("cell_count", 1)) >= 2
+        if _mc2:
+            _b = sum(1 for c in ch_list if c.get("geometry","body") == "body" and not c.get("is_fine"))
+            _c = sum(1 for c in ch_list if c.get("geometry","body") == "cell" and not c.get("is_fine"))
+            _v = sum(1 for c in ch_list if c.get("geometry","body") == "virtual")
+            _cells = int(st.session_state.get("cell_count", 1))
+            _total = _b + _c * _cells
+            st.markdown(
+                f'<p style="color:var(--ma-amber);font-family:Share Tech Mono,'
+                f'monospace;font-size:0.75rem;margin-top:0.55rem;line-height:1.3">'
+                f'{_total} DMX<br><span style="font-size:0.65rem;color:#AAAAAA">'
+                f'B:{_b} C:{_c} V:{_v}</span></p>',
+                unsafe_allow_html=True
+            )
+        else:
+            st.markdown(
+                f'<p style="color:var(--ma-amber);font-family:Share Tech Mono,'
+                f'monospace;font-size:0.82rem;margin-top:0.55rem">'
+                f'{len(ch_list)} CH</p>',
+                unsafe_allow_html=True
+            )
     with hc4:
         st.write(""); st.write("")
         if st.button("🗑", key=f"rm_{mode_idx}",
@@ -940,6 +990,36 @@ for mode_idx, mode in enumerate(st.session_state.modes):
 
     with st.expander(ch_label, expanded=True):
 
+        # Legend and virtual dimmer shortcut when multi-cell is active
+        _mc = int(st.session_state.get("cell_count", 1)) >= 2
+        if _mc:
+            leg1, leg2, leg3, leg4 = st.columns(4)
+            with leg1:
+                st.markdown(
+                    '<span style="color:#E8A000;font-family:Share Tech Mono,' +
+                    'monospace;font-size:0.72rem">■ BODY</span>' +
+                    '<span style="color:#888;font-size:0.7rem"> once</span>',
+                    unsafe_allow_html=True)
+            with leg2:
+                st.markdown(
+                    '<span style="color:#00E000;font-family:Share Tech Mono,' +
+                    'monospace;font-size:0.72rem">■ CELL</span>' +
+                    '<span style="color:#888;font-size:0.7rem"> × each cell</span>',
+                    unsafe_allow_html=True)
+            with leg3:
+                st.markdown(
+                    '<span style="color:#4AB0FF;font-family:Share Tech Mono,' +
+                    'monospace;font-size:0.72rem">■ VIRT</span>' +
+                    '<span style="color:#888;font-size:0.7rem"> no DMX addr</span>',
+                    unsafe_allow_html=True)
+            with leg4:
+                if st.button("＋ Virtual Dimmer",
+                             key=f"add_vdim_{mode_idx}",
+                             help="Add a virtual Dimmer to each cell — no DMX address, "
+                                  "MA3 uses it as per-cell intensity for pixel mapping"):
+                    ch_list.append(make_channel_entry("Dimmer", geometry="virtual"))
+                    st.rerun()
+
         if not ch_list:
             st.markdown(
                 '<p style="color:#AAAAAA;font-size:0.85rem;padding:0.5rem 0">' +
@@ -959,18 +1039,25 @@ for mode_idx, mode in enumerate(st.session_state.modes):
                 f'<span class="badge {"b-ok" if known else "b-unk"}">{attr}</span>'
             )
 
-            # ── Channel row: number | name | badge | ▲ | ▼ | ✕ ──────────────────
-            # Use stable ch_id in widget key so moves don't corrupt input values
-            r1, r2, r3, r4, r5, r6 = st.columns([0.4, 2.5, 1.2, 0.35, 0.35, 0.35])
+            # ── Channel row ───────────────────────────────────────────────────────
+            # Geometry toggle only shown when multi-cell mode is active
+            is_multicell = int(st.session_state.get("cell_count", 1)) >= 2
+            ch_geo = ch.get("geometry", "body")
+
+            if is_multicell:
+                r1, r2, r3, r4, r5, r6, r7 = st.columns([0.4, 2.0, 1.1, 0.8, 0.35, 0.35, 0.35])
+            else:
+                r1, r2, r3, r4, r5, r6 = st.columns([0.4, 2.5, 1.2, 0.35, 0.35, 0.35])
+                r7 = None
 
             with r1:
+                # Show DMX number — virtual channels show V instead
+                num_label = "V" if ch_geo == "virtual" else str(ci + 1)
                 st.markdown(
-                    f'<p class="ch-num">{ci+1}</p>',
+                    f'<p class="ch-num">{num_label}</p>',
                     unsafe_allow_html=True
                 )
             with r2:
-                # Key uses stable channel ID — so after a swap the widget
-                # renders with the correct stored name, not the old position's value
                 new_name = st.text_input(
                     "ch", value=ch["name"],
                     label_visibility="collapsed",
@@ -983,19 +1070,56 @@ for mode_idx, mode in enumerate(st.session_state.modes):
                     f'<div style="margin-top:0.5rem">{badge}</div>',
                     unsafe_allow_html=True
                 )
-            with r4:
-                if st.button("▲", key=f"up_{ch_id}",
-                             disabled=ci == 0, help="Move up"):
-                    ch_to_move = (ci, -1)
-            with r5:
-                if st.button("▼", key=f"dn_{ch_id}",
-                             disabled=ci == len(ch_list)-1,
-                             help="Move down"):
-                    ch_to_move = (ci, 1)
-            with r6:
-                if st.button("✕", key=f"del_{ch_id}",
-                             help="Remove channel"):
+
+            if is_multicell and r7 is not None:
+                with r4:
+                    # Geometry toggle: BODY / CELL / VIRT
+                    geo_labels = ["BODY", "CELL", "VIRT"]
+                    geo_values = ["body", "cell", "virtual"]
+                    geo_idx    = geo_values.index(ch_geo) if ch_geo in geo_values else 0
+                    # Colour the badge to match
+                    geo_colours = {"body": "#E8A000", "cell": "#00E000", "virtual": "#4AB0FF"}
+                    col = geo_colours.get(ch_geo, "#AAAAAA")
+                    st.markdown(
+                        f'<p style="color:{col};font-family:Share Tech Mono,monospace;' +
+                        f'font-size:0.65rem;margin-top:0.6rem;letter-spacing:0.05em;">' +
+                        f'{geo_labels[geo_idx]}</p>',
+                        unsafe_allow_html=True
+                    )
+                with r5:
+                    # Cycle through BODY → CELL → VIRT → BODY on click
+                    if st.button("⇄", key=f"geo_{ch_id}",
+                                 help="Toggle: BODY / CELL / VIRTUAL"):
+                        next_idx = (geo_values.index(ch_geo) + 1) % 3 if ch_geo in geo_values else 1
+                        ch["geometry"] = geo_values[next_idx]
+                        st.rerun()
+                with r6:
+                    if st.button("▲", key=f"up_{ch_id}",
+                                 disabled=ci == 0, help="Move up"):
+                        ch_to_move = (ci, -1)
+                with r7:
+                    if st.button("▼", key=f"dn_{ch_id}",
+                                 disabled=ci == len(ch_list)-1,
+                                 help="Move down"):
+                        ch_to_move = (ci, 1)
+                # Delete is in a second row to keep the row compact on mobile
+                if st.button(f"✕ Remove {ch['name']}", key=f"del_{ch_id}",
+                             use_container_width=False):
                     ch_to_delete = ci
+            else:
+                with r4:
+                    if st.button("▲", key=f"up_{ch_id}",
+                                 disabled=ci == 0, help="Move up"):
+                        ch_to_move = (ci, -1)
+                with r5:
+                    if st.button("▼", key=f"dn_{ch_id}",
+                                 disabled=ci == len(ch_list)-1,
+                                 help="Move down"):
+                        ch_to_move = (ci, 1)
+                with r6:
+                    if st.button("✕", key=f"del_{ch_id}",
+                                 help="Remove channel"):
+                        ch_to_delete = ci
 
             # ── DMX Slot / Channel Set Editor ────────────────────────────────────
             show_slots = (
