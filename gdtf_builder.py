@@ -536,13 +536,14 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
     if not multi_cell:
         ET.SubElement(geos, "Geometry", Name="Body", Model="", Position=IDENTITY)
     else:
-        # Body is the root — DMXMode points here
-        body_el = ET.SubElement(geos, "Geometry", Name="Body",
-                                Model="", Position=IDENTITY)
-        # Pixel template is a child of Body
-        pixel_el = ET.SubElement(body_el, "Geometry", Name="Pixel",
+        # Body and Pixel are separate top-level geometries inside <Geometries>
+        # Body — parent/shared channels (Break=1), DMXMode points here
+        ET.SubElement(geos, "Geometry", Name="Body",
+                      Model="", Position=IDENTITY)
+        # Pixel — cell template, top-level sibling of Body (not a child)
+        pixel_el = ET.SubElement(geos, "Geometry", Name="Pixel",
                                  Model="", Position=IDENTITY)
-        # GeometryReferences live inside the Pixel template (per official spec)
+        # GeometryReferences live inside the Pixel template
         # Each has a mandatory <Break DMXOffset="1"/> child
         for n in range(1, cell_count + 1):
             x   = (n - 1) * 0.1
