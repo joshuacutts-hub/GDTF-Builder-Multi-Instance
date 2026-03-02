@@ -511,60 +511,82 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
     ET.SubElement(ft, "Models")
 
     # Geometries
-    # MA3 parent/child sub-fixture rules:
-    #   1. CanHaveChildren="Yes" on FixtureType  (done above)
-    #   2. Cell template geometry must be a CHILD of Body (not a root sibling)
-    #   3. GeometryReference needs Break=N — one break per cell
-    #   4. DMX channels for cell N must use DMXBreak=N to match
-    # Body uses Break=1 (implicit). Cells use Break=2..N+1.
-    # MA3 reads this tree and creates sub-fixtures 2.1, 2.2 ... automatically.
+    # ── Correct MA3 multi-cell / sub-fixture geometry structure ──────────────
+    #
+    #  <Geometry Name="Fixture">          root wrapper — DMXMode points here
+    #    <Geometry Name="Body"/>          shared/parent channels (Break 1)
+    #    <Geometry Name="Pixel">          cell TEMPLATE geometry
+    #      <GeometryReference            one per cell, each with unique Break
+    #         Name="Pixel_1"
+    #         Geometry="Pixel"           ← references the template by name
+    #         Break="2"/>                ← MA3 maps DMXBreak=2 → sub-fixture 2.1
+    #      <GeometryReference
+    #         Name="Pixel_2" Geometry="Pixel" Break="3"/>   → sub-fixture 2.2
+    #      ...
+    #    </Geometry>
+    #  </Geometry>
+    #
+    #  DMXChannel Geometry="Body"   DMXBreak="1"    → parent fixture channels
+    #  DMXChannel Geometry="Pixel"  DMXBreak="N+1"  → cell template name (not Pixel_N!)
+    #    MA3 resolves: DMXBreak=N+1 → GeometryReference with Break=N+1 → Pixel_N
+    #
+    # CanHaveChildren="Yes" on FixtureType (set above) tells MA3 to create
+    # sub-fixtures automatically when patching: 2 (parent), 2.1, 2.2, ...
     IDENTITY = "1,0,0,0 0,1,0,0 0,0,1,0 0,0,0,1"
     geos = ET.SubElement(ft, "Geometries")
     if not multi_cell:
+        # Single geometry — simple Body
         ET.SubElement(geos, "Geometry", Name="Body", Model="", Position=IDENTITY)
     else:
-        # Body is the root geometry — parent fixture (2)
-        body_el = ET.SubElement(geos, "Geometry", Name="Body",
-                                Model="", Position=IDENTITY)
-        # Cell template is a CHILD of Body — MA3 uses this to define the sub-fixture type
-        cell_tmpl = ET.SubElement(body_el, "Geometry", Name="Cell",
-                                  Model="", Position=IDENTITY)
-        # N GeometryReferences, each with its own Break number — sub-fixtures (2.1, 2.2 ...)
-        # Break starts at 2 (Break 1 is reserved for Body/parent channels)
+        # Root wrapper — DMXMode references this
+        fixture_el = ET.SubElement(geos, "Geometry", Name="Fixture",
+                                   Model="", Position=IDENTITY)
+        # Body child — parent/shared channels live here
+        ET.SubElement(fixture_el, "Geometry", Name="Body",
+                      Model="", Position=IDENTITY)
+        # Pixel template child — cell channel template
+        pixel_el = ET.SubElement(fixture_el, "Geometry", Name="Pixel",
+                                 Model="", Position=IDENTITY)
+        # N GeometryReferences inside the template — one per cell
+        # Break starts at 2 (Break 1 = Body/parent)
+        # MA3 reads: Break=2 → sub-fixture 2.1, Break=3 → 2.2, etc.
         for n in range(1, cell_count + 1):
             x   = (n - 1) * 0.1
             pos = f"1,0,0,0 0,1,0,0 0,0,1,0 {x:.3f},0,0,1"
-            ET.SubElement(body_el, "GeometryReference",
-                          Name=f"Cell_{n}", Position=pos,
-                          Geometry="Cell", Break=str(n + 1))
+            ET.SubElement(pixel_el, "GeometryReference",
+                          Name=f"Pixel_{n}", Position=pos,
+                          Geometry="Pixel", Break=str(n + 1))
 
     # DMX Modes
     dmx_modes_el = ET.SubElement(ft, "DMXModes")
     for mode_name, (body_chs, cell_chs) in modes_dict.items():
         safe_mode = _safe(mode_name, "Mode")
-        mode_el = ET.SubElement(dmx_modes_el, "DMXMode",
-                                Name=safe_mode, Geometry="Body")
-        chs_el = ET.SubElement(mode_el, "DMXChannels")
+        # DMXMode Geometry must point to the root wrapper geometry
+        mode_geo  = "Fixture" if multi_cell else "Body"
+        mode_el   = ET.SubElement(dmx_modes_el, "DMXMode",
+                                  Name=safe_mode, Geometry=mode_geo)
+        chs_el    = ET.SubElement(mode_el, "DMXChannels")
 
         if not multi_cell:
-            # Single geometry — body channels to Body, Break=1
+            # Single geometry — all body channels to Body, Break=1
             _emit_channels_for_geometry(
                 chs_el, body_chs, safe_mode,
                 body_wheel_registry, "Body",
                 start_offset=1, dmx_break=1)
         else:
-            # Body channels — Break=1, emitted once
+            # Body (parent) channels — Geometry="Body", Break=1, sequential offsets
             next_offset = _emit_channels_for_geometry(
                 chs_el, body_chs, safe_mode,
                 body_wheel_registry, "Body",
                 start_offset=1, dmx_break=1)
-            # Cell_N channels — Break=N+1 matches GeometryReference Break=N+1
-            # MA3 uses the Break number to assign DMX addresses per sub-fixture
-            # Each cell resets its offset to 1 — they are independent address spaces
+            # Cell channels — Geometry="Pixel" (template name, NOT Pixel_N)
+            # Break=N+1 matches the GeometryReference Break=N+1 inside the Pixel geometry
+            # MA3 resolves: DMXBreak=2 → GeometryReference Break=2 → Pixel_1 → sub-fixture 2.1
+            # Each cell's offsets restart at 1 — independent DMX address spaces per sub-fixture
             for n in range(1, cell_count + 1):
                 _emit_channels_for_geometry(
                     chs_el, cell_chs, safe_mode,
-                    cell_wheel_registry, f"Cell_{n}",
+                    cell_wheel_registry, "Pixel",
                     start_offset=1, dmx_break=n + 1)
 
         ET.SubElement(mode_el, "Relations")
