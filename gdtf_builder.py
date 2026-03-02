@@ -541,19 +541,20 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
         # Root wrapper — DMXMode references this
         fixture_el = ET.SubElement(geos, "Geometry", Name="Fixture",
                                    Model="", Position=IDENTITY)
-        # Body child — parent/shared channels live here
+        # Body child — parent/shared channels live here (Break=1)
         ET.SubElement(fixture_el, "Geometry", Name="Body",
                       Model="", Position=IDENTITY)
-        # Pixel template child — cell channel template
-        pixel_el = ET.SubElement(fixture_el, "Geometry", Name="Pixel",
-                                 Model="", Position=IDENTITY)
-        # N GeometryReferences inside the template — one per cell
-        # Break starts at 2 (Break 1 = Body/parent)
-        # MA3 reads: Break=2 → sub-fixture 2.1, Break=3 → 2.2, etc.
+        # Pixel template — just the geometry definition, NO children
+        # GeometryReferences must NOT live inside the geometry they reference
+        # or MA3 reports an infinite loop error
+        ET.SubElement(fixture_el, "Geometry", Name="Pixel",
+                      Model="", Position=IDENTITY)
+        # GeometryReferences are siblings of Pixel inside Fixture (not children of Pixel)
+        # Break=N+1 → MA3 sub-fixture 2.N  (Break=1 reserved for Body/parent)
         for n in range(1, cell_count + 1):
             x   = (n - 1) * 0.1
             pos = f"1,0,0,0 0,1,0,0 0,0,1,0 {x:.3f},0,0,1"
-            ET.SubElement(pixel_el, "GeometryReference",
+            ET.SubElement(fixture_el, "GeometryReference",
                           Name=f"Pixel_{n}", Position=pos,
                           Geometry="Pixel", Break=str(n + 1))
 
