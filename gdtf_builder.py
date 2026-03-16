@@ -320,7 +320,8 @@ def _emit_one_channel(chs_el, ch, safe_mode, wheel_registry,
     safe_ch    = _safe(ch.name, f"Ch{offset if not virtual else 'V'}")
     cf_name    = attr
     offset_str = "None" if virtual else str(offset)
-    initial_fn = f"{safe_mode}.{safe_ch}.{attr}.{cf_name}"
+    # InitialFunction: ModeName.GeometryName_Attribute.Attribute.ChannelFunction
+    initial_fn = f"{safe_mode}.{geometry_name}_{attr}.{attr}.{cf_name}"
 
     if ch.slots:
         wname = wheel_registry.get(attr, "")
@@ -548,30 +549,16 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
         # Pixel — cell template, also top-level (NOT a child of Body).
         ET.SubElement(geos, "Geometry", Name="Pixel",
                       Model="", Position=IDENTITY)
-        # GeometryReferences are ALSO top-level siblings — NOT inside Pixel.
-        # Putting them inside Pixel causes MA3's "infinite loop" error because
-        # GeometryReference Geometry="Pixel" would be referencing its own parent.
-        # Each GeometryReference has a <Break DMXOffset="N"/> child element
-        # where DMXOffset is the starting channel offset for that cell instance.
-        # For a 3-channel cell (R,G,B): offsets are 1, 4, 7, 10...
-        cell_ch_count = sum(
-            1 for b, c in modes_dict.values()
-            for ch in c if not ch.is_fine_byte and "virtual" not in ch.name.lower()
-        )
-        # Deduplicate — count per mode (all modes should have same cell layout)
-        first_cell_chs = next(iter(modes_dict.values()))[1]
-        n_cell_real = sum(
-            1 for ch in first_cell_chs
-            if not ch.is_fine_byte and "virtual" not in ch.name.lower()
-        )
+        # GeometryReferences are top-level siblings of Body and Pixel.
+        # Per the official GDTF spec example, these are plain elements with no
+        # child <Break> nodes — those are only needed for split-channel use cases.
+        # The DMXBreak="Overwrite" on cell channels is what links them to these refs.
         for n in range(1, cell_count + 1):
             x   = (n - 1) * 0.1
             pos = f"1,0,0,0 0,1,0,0 0,0,1,0 {x:.3f},0,0,1"
-            dmx_offset = (n - 1) * n_cell_real + 1
-            ref_el = ET.SubElement(geos, "GeometryReference",
-                                   Name=f"Pixel_{n}", Position=pos,
-                                   Geometry="Pixel")
-            ET.SubElement(ref_el, "Break", DMXOffset=str(dmx_offset))
+            ET.SubElement(geos, "GeometryReference",
+                          Name=f"Pixel_{n}", Position=pos,
+                          Geometry="Pixel")
 
     # DMX Modes
     dmx_modes_el = ET.SubElement(ft, "DMXModes")
@@ -589,18 +576,24 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
                 body_wheel_registry, "Body",
                 start_offset=1, dmx_break=1)
         else:
-            # Body channels — Break=1, sequential offsets, Geometry="Body"
+            # Body channels — Break=1, Geometry="Body"
             _emit_channels_for_geometry(
                 chs_el, body_chs, safe_mode,
                 body_wheel_registry, "Body",
                 start_offset=1, dmx_break=1)
-            # Cell channels — DMXBreak="Overwrite", Geometry="Pixel"
-            # "Overwrite" tells the console to substitute the actual break
-            # number from the GeometryReference at patch time.
-            # All cell channels are written ONCE with sequential offsets 1,2,3...
-            # The console repeats them for each GeometryReference instance.
+            # Virtual dimmer(s) — Geometry="Pixel", NO DMXBreak (defaults to 1),
+            # Offset="None". Per spec example the virtual channel has no Break attr.
+            virt_chs = [c for c in cell_chs if "virtual" in c.name.lower()]
+            real_chs = [c for c in cell_chs if "virtual" not in c.name.lower()]
+            # Virtual channels emitted first, with default break (1)
             _emit_channels_for_geometry(
-                chs_el, cell_chs, safe_mode,
+                chs_el, virt_chs, safe_mode,
+                cell_wheel_registry, "Pixel",
+                start_offset=1, dmx_break=1)
+            # Real cell channels — DMXBreak="Overwrite", Offset=1,2,3...
+            # "Overwrite" = console fills in the break from each GeometryReference
+            _emit_channels_for_geometry(
+                chs_el, real_chs, safe_mode,
                 cell_wheel_registry, "Pixel",
                 start_offset=1, dmx_break="Overwrite")
 
@@ -616,15 +609,12 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
         if virt_chs and real_color_chs:
             virt_ch = virt_chs[0]
             v_attr, *_ = resolve_attr(virt_ch.name)
-            v_safe = _safe(virt_ch.name, "VDimmer")
-            # Master node path: ModeName.ChannelName (DMXChannel name = geo_attr)
-            master_node = f"{safe_mode}.Pixel_{v_safe}"
-            # Actually the DMXChannel name in GDTF = Geometry_Attribute
+            # DMXChannel node name = Geometry_Attribute (per GDTF spec)
+            # Master path: ModeName.Geometry_Attribute
             master_node = f"{safe_mode}.Pixel_{v_attr}"
             for color_ch in real_color_chs:
                 c_attr, *_ = resolve_attr(color_ch.name)
-                c_safe = _safe(color_ch.name, c_attr)
-                # Follower is the ChannelFunction path
+                # Follower path: ModeName.Geometry_Attribute.LogicalChannel.ChannelFunction
                 follower_node = f"{safe_mode}.Pixel_{c_attr}.{c_attr}.{c_attr}"
                 ET.SubElement(relations_el, "Relation",
                     Name=f"VDim_{c_attr}",
