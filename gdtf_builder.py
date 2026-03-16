@@ -310,11 +310,11 @@ def _emit_one_channel(chs_el, ch, safe_mode, wheel_registry,
                       geometry_name, offset, virtual=False, dmx_break=1):
     """
     Emit a single DMXChannel element.
-    virtual=True  -> Offset="None"  (no DMX address — MA3 virtual dimmer)
+    virtual=True  -> Offset="None", Highlight="255/1", Master="Grand"
+                     (virtual dimmer — no DMX address, Relations connect it
+                     to colour channels; generated in the Relations block)
     dmx_break     -> DMXBreak value: integer for normal breaks, or "Overwrite"
                      for cell channels in multi-cell fixtures (per GDTF spec).
-                     "Overwrite" tells the console to substitute the actual
-                     break number from the GeometryReference at patch time.
     """
     attr, fg, feat, ag = resolve_attr(ch.name)
     safe_ch    = _safe(ch.name, f"Ch{offset if not virtual else 'V'}")
@@ -352,13 +352,15 @@ def _emit_one_channel(chs_el, ch, safe_mode, wheel_registry,
                 cs_kw["WheelSlotIndex"] = str(slot_idx + 1)
             ET.SubElement(cf_el, "ChannelSet", **cs_kw)
     else:
+        # Virtual dimmer: Offset="None", Master="Grand" so Grand Master affects it
+        master_val = "Grand" if virtual else "None"
         ch_el = ET.SubElement(chs_el, "DMXChannel",
             DMXBreak=str(dmx_break), Offset=offset_str,
             Default="0/1", Highlight="255/1",
             Geometry=geometry_name, InitialFunction=initial_fn)
         log_el = ET.SubElement(ch_el, "LogicalChannel",
             Attribute=attr, Snap="No",
-            Master="None", MibFade="0", DMXChangeTimeLimit="0")
+            Master=master_val, MibFade="0", DMXChangeTimeLimit="0")
         ET.SubElement(log_el, "ChannelFunction",
             Name=cf_name, Attribute=attr,
             OriginalAttribute=_safe(ch.name),
@@ -393,7 +395,9 @@ def _emit_channels_for_geometry(chs_el, channels, safe_mode,
             prev_ch_el = None
             continue
 
-        virtual = (getattr(ch, "geometry", "body") == "virtual")
+        # Virtual = channel named "virtual dimmer" — no DMX address,
+        # Offset="None", Master="Grand", Relations multiply onto colour channels
+        virtual = "virtual" in ch.name.lower()
         ch_el = _emit_one_channel(chs_el, ch, safe_mode, wheel_registry,
                                   geometry_name, offset, virtual=virtual,
                                   dmx_break=dmx_break)
@@ -401,6 +405,7 @@ def _emit_channels_for_geometry(chs_el, channels, safe_mode,
             prev_ch_el = ch_el
             prev_offset_start = offset
             offset += 1
+        # virtual channels don't consume a DMX offset
 
     return offset
 
@@ -536,22 +541,37 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
     if not multi_cell:
         ET.SubElement(geos, "Geometry", Name="Body", Model="", Position=IDENTITY)
     else:
-        # Body and Pixel are separate top-level geometries inside <Geometries>
-        # Body — parent/shared channels (Break=1), DMXMode points here
+        # Both Body and Pixel are top-level geometries (siblings in <Geometries>).
+        # Body — shared/parent channels, DMXMode points here.
         ET.SubElement(geos, "Geometry", Name="Body",
                       Model="", Position=IDENTITY)
-        # Pixel — cell template, top-level sibling of Body (not a child)
-        pixel_el = ET.SubElement(geos, "Geometry", Name="Pixel",
-                                 Model="", Position=IDENTITY)
-        # GeometryReferences live inside the Pixel template
-        # Each has a mandatory <Break DMXOffset="1"/> child
+        # Pixel — cell template, also top-level (NOT a child of Body).
+        ET.SubElement(geos, "Geometry", Name="Pixel",
+                      Model="", Position=IDENTITY)
+        # GeometryReferences are ALSO top-level siblings — NOT inside Pixel.
+        # Putting them inside Pixel causes MA3's "infinite loop" error because
+        # GeometryReference Geometry="Pixel" would be referencing its own parent.
+        # Each GeometryReference has a <Break DMXOffset="N"/> child element
+        # where DMXOffset is the starting channel offset for that cell instance.
+        # For a 3-channel cell (R,G,B): offsets are 1, 4, 7, 10...
+        cell_ch_count = sum(
+            1 for b, c in modes_dict.values()
+            for ch in c if not ch.is_fine_byte and "virtual" not in ch.name.lower()
+        )
+        # Deduplicate — count per mode (all modes should have same cell layout)
+        first_cell_chs = next(iter(modes_dict.values()))[1]
+        n_cell_real = sum(
+            1 for ch in first_cell_chs
+            if not ch.is_fine_byte and "virtual" not in ch.name.lower()
+        )
         for n in range(1, cell_count + 1):
             x   = (n - 1) * 0.1
             pos = f"1,0,0,0 0,1,0,0 0,0,1,0 {x:.3f},0,0,1"
-            ref_el = ET.SubElement(pixel_el, "GeometryReference",
+            dmx_offset = (n - 1) * n_cell_real + 1
+            ref_el = ET.SubElement(geos, "GeometryReference",
                                    Name=f"Pixel_{n}", Position=pos,
                                    Geometry="Pixel")
-            ET.SubElement(ref_el, "Break", DMXOffset="1")
+            ET.SubElement(ref_el, "Break", DMXOffset=str(dmx_offset))
 
     # DMX Modes
     dmx_modes_el = ET.SubElement(ft, "DMXModes")
@@ -584,7 +604,33 @@ def build_gdtf(fixture_name, manufacturer, modes_dict, cell_count=1):
                 cell_wheel_registry, "Pixel",
                 start_offset=1, dmx_break="Overwrite")
 
-        ET.SubElement(mode_el, "Relations")
+        # Relations — virtual dimmer multiplies each cell colour channel
+        # Per GDTF spec: Relation Type="Multiply" links virtual Dimmer (Master)
+        # to each real colour ChannelFunction (Follower) so the console can
+        # scale all colours together as a single intensity control.
+        relations_el = ET.SubElement(mode_el, "Relations")
+        virt_chs = [c for c in cell_chs
+                    if "virtual" in c.name.lower() and not c.is_fine_byte]
+        real_color_chs = [c for c in cell_chs
+                          if "virtual" not in c.name.lower() and not c.is_fine_byte]
+        if virt_chs and real_color_chs:
+            virt_ch = virt_chs[0]
+            v_attr, *_ = resolve_attr(virt_ch.name)
+            v_safe = _safe(virt_ch.name, "VDimmer")
+            # Master node path: ModeName.ChannelName (DMXChannel name = geo_attr)
+            master_node = f"{safe_mode}.Pixel_{v_safe}"
+            # Actually the DMXChannel name in GDTF = Geometry_Attribute
+            master_node = f"{safe_mode}.Pixel_{v_attr}"
+            for color_ch in real_color_chs:
+                c_attr, *_ = resolve_attr(color_ch.name)
+                c_safe = _safe(color_ch.name, c_attr)
+                # Follower is the ChannelFunction path
+                follower_node = f"{safe_mode}.Pixel_{c_attr}.{c_attr}.{c_attr}"
+                ET.SubElement(relations_el, "Relation",
+                    Name=f"VDim_{c_attr}",
+                    Master=master_node,
+                    Follower=follower_node,
+                    Type="Multiply")
         ET.SubElement(mode_el, "FTMacros")
 
     revisions = ET.SubElement(ft, "Revisions")
