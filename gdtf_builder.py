@@ -310,30 +310,47 @@ def _emit_one_channel(chs_el, ch, safe_mode, wheel_registry,
                       geometry_name, offset, virtual=False, dmx_break=1):
     """
     Emit a single DMXChannel element.
-    virtual=True  -> Offset="None", Highlight="255/1", Master="Grand"
-                     (virtual dimmer — no DMX address, Relations connect it
-                     to colour channels; generated in the Relations block)
-    dmx_break     -> DMXBreak value: integer for normal breaks, or "Overwrite"
-                     for cell channels in multi-cell fixtures (per GDTF spec).
+
+    virtual=True  — Per official GDTF spec example, virtual channels omit
+                    DMXBreak, Offset, Default, and InitialFunction entirely.
+                    Only Highlight and Geometry are present on the element.
+                    LogicalChannel gets Master="Grand".
+
+    dmx_break     — "Overwrite" for real cell channels so the console fills
+                    in the break number from each GeometryReference.
     """
-    attr, fg, feat, ag = resolve_attr(ch.name)
-    safe_ch    = _safe(ch.name, f"Ch{offset if not virtual else 'V'}")
-    cf_name    = attr
-    offset_str = "None" if virtual else str(offset)
-    # InitialFunction: ModeName.GeometryName_Attribute.Attribute.ChannelFunction
-    initial_fn = f"{safe_mode}.{geometry_name}_{attr}.{attr}.{cf_name}"
+    attr, *_ = resolve_attr(ch.name)
+    # InitialFunction: ModeName.GeometryName_Attribute.Attribute.Attribute
+    initial_fn = f"{safe_mode}.{geometry_name}_{attr}.{attr}.{attr}"
+
+    if virtual:
+        # Spec example: <DMXChannel Highlight="255/1" Geometry="Pixel">
+        # No DMXBreak, no Offset, no Default, no InitialFunction
+        ch_el = ET.SubElement(chs_el, "DMXChannel",
+            Highlight="255/1",
+            Geometry=geometry_name)
+        log_el = ET.SubElement(ch_el, "LogicalChannel",
+            Attribute=attr, Snap="No",
+            Master="Grand", MibFade="0", DMXChangeTimeLimit="0")
+        ET.SubElement(log_el, "ChannelFunction",
+            Name=attr, Attribute=attr,
+            OriginalAttribute=_safe(ch.name),
+            DMXFrom="0/1", Default="0/1",
+            PhysicalFrom="0.000000", PhysicalTo="1.000000",
+            RealFade="0", RealAcceleration="0", WheelSlotIndex="0")
+        return ch_el
 
     if ch.slots:
         wname = wheel_registry.get(attr, "")
         ch_el = ET.SubElement(chs_el, "DMXChannel",
-            DMXBreak=str(dmx_break), Offset=offset_str,
+            DMXBreak=str(dmx_break), Offset=str(offset),
             Default="0/1", Highlight="255/1",
             Geometry=geometry_name, InitialFunction=initial_fn)
         log_el = ET.SubElement(ch_el, "LogicalChannel",
             Attribute=attr, Snap="Yes",
             Master="None", MibFade="0", DMXChangeTimeLimit="0")
         cf_kw = dict(
-            Name=cf_name, Attribute=attr,
+            Name=attr, Attribute=attr,
             OriginalAttribute=_safe(ch.name),
             DMXFrom="0/1", Default="0/1",
             PhysicalFrom="0.000000", PhysicalTo="1.000000",
@@ -353,23 +370,22 @@ def _emit_one_channel(chs_el, ch, safe_mode, wheel_registry,
                 cs_kw["WheelSlotIndex"] = str(slot_idx + 1)
             ET.SubElement(cf_el, "ChannelSet", **cs_kw)
     else:
-        # Virtual dimmer: Offset="None", Master="Grand" so Grand Master affects it
-        master_val = "Grand" if virtual else "None"
         ch_el = ET.SubElement(chs_el, "DMXChannel",
-            DMXBreak=str(dmx_break), Offset=offset_str,
+            DMXBreak=str(dmx_break), Offset=str(offset),
             Default="0/1", Highlight="255/1",
             Geometry=geometry_name, InitialFunction=initial_fn)
         log_el = ET.SubElement(ch_el, "LogicalChannel",
             Attribute=attr, Snap="No",
-            Master=master_val, MibFade="0", DMXChangeTimeLimit="0")
+            Master="None", MibFade="0", DMXChangeTimeLimit="0")
         ET.SubElement(log_el, "ChannelFunction",
-            Name=cf_name, Attribute=attr,
+            Name=attr, Attribute=attr,
             OriginalAttribute=_safe(ch.name),
             DMXFrom="0/1", Default="0/1",
             PhysicalFrom="0.000000", PhysicalTo="1.000000",
             RealFade="0", RealAcceleration="0", WheelSlotIndex="0")
 
     return ch_el
+
 
 
 def _emit_channels_for_geometry(chs_el, channels, safe_mode,
